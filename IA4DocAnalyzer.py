@@ -589,24 +589,16 @@ def _move_values(ws, src_row: int, dst_row: int, n_rows: int, n_cols: int) -> No
             ws.cell(dst_row + r_off, c).value = tmp[r_off][c-1]
 
 def _normalize_table2_location(ws) -> tuple[int, int]:
-    """Ensure Tableau 2 is anchored at row 20 (title in B20). Returns (title_row, labels_start_row)."""
-    TARGET_ROW = 20
-    found_row = _find_row_by_title_fuzzy(ws, _T2_TITLE)
-    title_row = found_row or TARGET_ROW
-    labels_start = title_row + 1
-    # If table exists elsewhere and B20 is blank, move it to row 20 to keep a single source of truth.
-    if found_row and found_row != TARGET_ROW and _is_blank(ws.cell(TARGET_ROW, 2).value):
-        height = _detect_table_block_height(ws, found_row + 1)
-        dates = _read_date_headers(ws, found_row, start_col=3)
-        n_rows = 1 + height
-        n_cols = 2 + max(1, len(dates))
-        _move_values(ws, found_row, TARGET_ROW, n_rows, n_cols)
-        title_row = TARGET_ROW
-        labels_start = TARGET_ROW + 1
-    # Ensure title exists at anchor
-    if _is_blank(ws.cell(TARGET_ROW, 2).value):
-        ws.cell(TARGET_ROW, 2).value = _T2_TITLE
-    return TARGET_ROW, TARGET_ROW + 1
+    """Locate Tableau 2 dynamically (no fixed row).
+
+    Returns (header_row, labels_start_row). The header row is the row where the title
+    is in column B and the weekly date headers start at column C.
+    """
+    found_row = _find_row_by_title_fuzzy(ws, _T2_TITLE) or _find_row_by_title(ws, _T2_TITLE)
+    if not found_row:
+        # Fallback to 20 for backward compatibility, but do NOT move anything.
+        return 20, 21
+    return int(found_row), int(found_row) + 1
 def _read_date_headers(ws, row: int, start_col: int = 3) -> list[_date]:
     out = []
     c = start_col
@@ -629,9 +621,14 @@ def _read_date_headers(ws, row: int, start_col: int = 3) -> list[_date]:
 def _find_or_append_date_col(ws, row: int, snap: _date, start_col: int = 3) -> int:
     dates = _read_date_headers(ws, row, start_col=start_col)
     if snap in dates:
-        return start_col + dates.index(snap)
+        col = start_col + dates.index(snap)
+        # Assure un format de date courte
+        ws.cell(row, col).number_format = "dd/mm/yy"
+        return col
     col = start_col + len(dates)
     ws.cell(row, col).value = _to_excel_datetime(snap)
+    # Format date courte dans Excel
+    ws.cell(row, col).number_format = "dd/mm/yy"
     return col
 
 def _read_block(ws, title_row: int, labels_start_row: int, stop_on_blank: bool = True) -> pd.DataFrame:
@@ -736,6 +733,8 @@ def _write_series_to_block(ws, header_row: int, labels_start_row: int, snap: _da
     # write
     for lab, row in mapping.items():
         ws.cell(row, col).value = int(values.get(lab, 0))
+        # Forcer le format numérique (évite l'affichage en dates si le format Excel a dérivé)
+        ws.cell(row, col).number_format = "0"
 
 
 
@@ -860,16 +859,27 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
     snap = cols[2].date_input("3) Date de la semaine", value=_date.today(), key="snap_kpi")
     fiches_files = st.session_state.get("fiches_uploaded_files", None)  # fiches uploadées en haut
 
-        # ✅ Persister l'historique pour éviter qu'il "disparaisse" lors des reruns (upload fiches/CDC)
+            # ✅ Gérer l'historique : persister les bytes et réagir quand l'utilisateur retire le fichier
+    prev_hist_present = st.session_state.get("hist_present", False)
+
     if hist_file is not None:
+        st.session_state["hist_present"] = True
         st.session_state["hist_bytes"] = hist_file.getvalue()
-        st.session_state["hist_name"] = getattr(hist_file, "name", "tableaux_hebdo.xlsx")
+    else:
+        if prev_hist_present:
+            # L'utilisateur vient de retirer tableaux_hebdo : on nettoie l'affichage KPI
+            st.session_state["hist_present"] = False
+            st.session_state.pop("hist_bytes", None)
+            st.session_state.pop("tab1_hist", None)
+            st.session_state.pop("tab2_hist", None)
+            st.session_state.pop("tab3_hist", None)
+            st.rerun()
+
     hist_bytes = st.session_state.get("hist_bytes")
 
     if hist_bytes is None:
-        pass
+        st.info("Veuillez uploader un fichier d'historique (tableaux_hebdo.xlsx) pour afficher les KPI.")
     else:
-        hist_bytes = hist_file.getvalue()
         # Workbook pour LECTURE (valeurs) : évite de perdre les valeurs de formules après écriture
         hist_wb_values = load_workbook(BytesIO(hist_bytes), data_only=True)
         ws_values = _pick_kpi_sheet(hist_wb_values)
@@ -915,7 +925,7 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
                 t2_current.loc["Total"] = int(t2_current.sum())
 
             # --- Écrire dans l'historique (Tableau 1 & 2) sur le workbook d'édition
-            t1_row = _find_row_by_title(ws_edit, _T1_TITLE) or 3
+            t1_row = _find_row_by_title_fuzzy(ws_edit, _T1_TITLE) or _find_row_by_title(ws_edit, _T1_TITLE) or 3
             _write_series_to_block(ws_edit, t1_row, t1_row + 1, snap, t1_current, desired_order=cats_order)
 
             # Ordre des états = ordre existant dans tableaux_hebdo (B20..) + nouveaux états du CDC,
@@ -983,14 +993,14 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
 
         # --- Écrire dans l'historique (Tableau 3)
         if t3_current is not None and not t3_current.empty:
-            t3_row = _find_row_by_title(ws_edit, _T3_TITLE) or 12
+            t3_row = _find_row_by_title_fuzzy(ws_edit, _T3_TITLE) or _find_row_by_title(ws_edit, _T3_TITLE) or 12
             _write_series_to_block(ws_edit, t3_row, t3_row+1, snap, t3_current, desired_order=None)
 
 
 
         # ===== Lire les 3 tableaux depuis l'historique (après écriture) =====
         # Tableau 1
-        t1_row = _find_row_by_title(ws_values, _T1_TITLE) or 3
+        t1_row = _find_row_by_title_fuzzy(ws_values, _T1_TITLE) or _find_row_by_title(ws_values, _T1_TITLE) or 3
         tab1_hist = _read_block(ws_values, t1_row, t1_row+1)
 
         # Tableau 2
@@ -1004,7 +1014,7 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
         tab2_hist = tab2_hist.apply(pd.to_numeric, errors="coerce").fillna(0).astype(int)
 
         # Tableau 3
-        t3_row = _find_row_by_title(ws_edit, _T3_TITLE) or 12
+        t3_row = _find_row_by_title_fuzzy(ws_edit, _T3_TITLE) or _find_row_by_title(ws_edit, _T3_TITLE) or 12
         tab3_hist = _read_block(ws_values, t3_row, t3_row+1)
 
         
@@ -1048,7 +1058,7 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
         out = BytesIO()
         hist_wb_edit.save(out)
         st.download_button(
-            "Télécharger l'historique mis à jour (tableaux_hebdo.xlsx)",
+            "Veuillez uploader un fichier d'historique (tableaux_hebdo.xlsx) pour afficher les KPI.",
             data=out.getvalue(),
             file_name=f"tableaux_hebdo_{snap:%d-%m-%y}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -1092,7 +1102,7 @@ with st.expander("📌 KPI (3 tableaux puis 3 graphiques)", expanded=True):
 
 
     else:
-        st.info("Charge `tableaux_hebdo.xlsx` pour afficher les tableaux et graphiques KPI.")
+        pass
 st.markdown("---")
 
 #Nettoie les cellules des fiches de test
@@ -1790,6 +1800,9 @@ if uploaded_files:
     # --- Gestion des exclusions manuelles (Cocher pour ignorer) ---
     if "excluded_test_uids" not in st.session_state:
         st.session_state["excluded_test_uids"] = set()
+
+    # 🔒 Exclusions manuelles désactivées (UI supprimée) : on repart toujours sans exclusion
+    st.session_state["excluded_test_uids"] = set()
 
     # ✅ Sécurité : test_uid doit exister quoi qu'il arrive
     if "test_uid" not in data.columns:
@@ -2510,30 +2523,9 @@ if uploaded_files:
         num_cols = df_clean_all.select_dtypes(include=["float", "int"]).columns
         df_clean_all[num_cols] = df_clean_all[num_cols].round(2)
 
-        # Editor pour exclure des tests (ID interne via l'index, non affiché)
-        df_editor = data[["test_uid", "fs_id", "ref_coedm", "test_label", "verdict_doc"]].copy()
-        df_editor = df_editor.set_index("test_uid")
-        df_editor["❌ Exclure"] = df_editor.index.isin(st.session_state["excluded_test_uids"])
+        st.dataframe(df_clean_all)
 
-        st.caption("Cochez ❌ Exclure pour ignorer des lignes (cela mettra à jour tous les tableaux).")
-        edited = st.data_editor(
-            df_editor[["fs_id", "ref_coedm", "test_label", "verdict_doc", "❌ Exclure"]],
-            hide_index=True,
-            column_config={
-                "fs_id": st.column_config.TextColumn("FS", disabled=True),
-                "ref_coedm": st.column_config.TextColumn("Document", disabled=True),
-                "test_label": st.column_config.TextColumn("Test", disabled=True),
-                "verdict_doc": st.column_config.TextColumn("Verdict", disabled=True),
-                "❌ Exclure": st.column_config.CheckboxColumn("❌ Exclure"),
-            },
-            disabled=["fs_id", "ref_coedm", "test_label", "verdict_doc"],
-            use_container_width=True,
-        )
-
-        # Mettre à jour la session_state
-        new_excluded = set(edited.index[edited["❌ Exclure"]].astype(int).tolist())
-        st.session_state["excluded_test_uids"] = new_excluded
-
+        st.caption("Sélection manuelle des fiches à exclure : désactivée.")
         # Affichage data filtrée, avec couleur verdict (SANS doc_id / test_uid)
         df_clean_f = data_f[clean_cols].copy()
         if "date_test" in df_clean_f.columns:
